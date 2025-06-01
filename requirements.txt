@@ -1,0 +1,6 @@
+Flask
+sentence-transformers
+faiss-cpu
+pandas
+numpy
+pytest
