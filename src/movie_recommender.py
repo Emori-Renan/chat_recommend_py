@@ -14,10 +14,10 @@ class MovieRecommender:
     movie recommendations based on user queries.
     """
     def __init__(self, movies_data_path='data/movies.csv',
-                 model_name='sentence-transformers/all-MiniLM-L6-v2',
-                 movie_embeddings_path='models/movie_embeddings.pkl', # This path is not strictly used for loading, but good to have
-                 movie_faiss_index_path='models/movie_faiss_index.bin',
-                 movie_df_path='models/movie_df.pkl'):
+                 anime_data_path='data/anime.csv', 
+                 model_name='all-MiniLM-L6-v2',
+                 movie_faiss_index_path='models/combined_content_faiss_index.bin.bin',
+                 movie_df_path='models/combined_content_df.pkl'):
         """
         Initializes the MovieRecommender.
 
@@ -30,180 +30,171 @@ class MovieRecommender:
         """
         self.movies_data_path = movies_data_path
         self.model_name = model_name
-        self.movie_embeddings_path = movie_embeddings_path
+        self.anime_data_path = anime_data_path
         self.movie_faiss_index_path = movie_faiss_index_path
         self.movie_df_path = movie_df_path
 
         self.embedding_model = None
         self.movie_faiss_index = None
         self.movies_df = None
-        self.movie_ids_map = None # To map FAISS index to DataFrame index (original pandas index)
         self._is_initialized = False # Flag to indicate successful initialization
 
-        # Ensure models directory exists
-        os.makedirs(os.path.dirname(movie_faiss_index_path), exist_ok=True)
-
         self._load_or_build_model()
-
+        
+    def _load_single_csv(self, file_path, content_source_type):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Data file not found at path: {file_path}")
+        
+        encondings_to_try = ['utf-8', 'latin-1', 'cp1252']
+        for encoding in encondings_to_try:
+            try:
+                temp_df = pd.read_csv(file_path, sep=',', encoding=encoding)
+                print(f"Successfully loaded {content_source_type} data with '{encoding}' encoding.")
+                
+                if content_source_type == 'movie':
+                    temp_df = temp_df.rename(columns={'movieId': 'contentId'})
+                    temp_df['type'] = 'movie'
+                    temp_df['genres'] = temp_df['genres'].fillna('').astype(str)
+                    
+                elif content_source_type == 'anime':
+                    temp_df = temp_df.rename(columns={'anime_id': 'contentId', 'name': 'title'})
+                    temp_df['genres'] = temp_df['genre'].fillna('').astype(str).str.replace(', ', '|')
+                    temp_df['type'] = temp_df['type'].fillna('').astype(str).str.lower()
+                    
+                    temp_df = temp_df.drop(columns='genre')
+            
+                temp_df['title'] = temp_df['title'].fillna('').astype(str)
+                
+                return temp_df[['contentId', 'title', 'genres', 'type']]
+        
+            except UnicodeDecodeError:
+                        print(f"Failed to load {content_source_type} with '{encoding}' encoding. Trying next...")
+            except pd.errors.ParserError as pe:
+                print(f"Parsing error for {content_source_type} with '{encoding}' encoding: {pe}. Data might not be in expected ',' format.")
+            except Exception as e:
+                print(f"An unexpected error occurred while loading {content_source_type} data with '{encoding}': {e}")
+                raise
+                
     def _load_or_build_model(self):
         """
-        Attempts to load pre-built movie FAISS index and DataFrame.
-        If files are not found, it builds them from scratch.
+        Attempts to load existing combined FAISS index and DataFrame.
+        If files are not found, it builds the model from scratch.
         """
         try:
-            if os.path.exists(self.movie_faiss_index_path) and os.path.exists(self.movie_df_path):
-                print(f"Loading existing movie FAISS index from {self.movie_faiss_index_path} and DataFrame from {self.movie_df_path}...")
-                self.embedding_model = SentenceTransformer(self.model_name) # Ensure model is loaded even if index exists
+            if (os.path.exists(self.movie_faiss_index_path) and
+                os.path.exists(self.movie_df_path)):
+                print("Loading existing combined content FAISS index and DataFrame...")
+                self.embedding_model = SentenceTransformer(self.model_name)
                 self.movie_faiss_index = faiss.read_index(self.movie_faiss_index_path)
-                self.movies_df = pd.read_pickle(self.movie_df_path)
-                self.movie_ids_map = self.movies_df.index.values # Re-establish the mapping
-                print("Movie models loaded successfully.")
+                with open(self.movie_df_path, 'rb') as f:
+                    self.movies_df = pickle.load(f)
+                
+                # Re-create the FAISS to DataFrame index map after loading
+                self.faiss_to_df_index_map = {idx: df_idx for idx, df_idx in enumerate(self.movies_df.index)}
+
+                print("Combined model loaded successfully.")
                 self._is_initialized = True
             else:
-                print("Building movie FAISS index and DataFrame from scratch...")
+                print("Combined model files not found. Building model from scratch...")
                 self._build_model()
+                self._is_initialized = True
         except Exception as e:
-            print(f"Error loading or building movie models: {e}")
-            self._is_initialized = False # Mark as failed to initialize
-
-    # Inside your MovieRecommender class, find the _build_model method
-
-    def _build_model(self):
-        """
-        Builds the FAISS index and preprocesses movie data if not already present.
-        """
-        self.movies_df = self._load_data() # This loads your movies.csv into a DataFrame
-
-        # --- RE-VERIFY THESE LINES CAREFULLY ---
-        # 1. Clean up titles: remove year for better embedding matching with queries
-        # Ensure 'title' column itself is string-like before applying regex
-        self.movies_df['clean_title'] = self.movies_df['title'].astype(str).apply(lambda x: re.sub(r' \(\d{4}\)', '', x))
-
-        # 2. Combine relevant columns for embedding: title and genres
-        #    Ensure all components are strings before combining.
-        #    Explicitly convert to string and strip whitespace.
-        self.movies_df['search_text'] = self.movies_df.apply(
-            lambda row: (
-                f"Movie: {str(row['clean_title']).strip()}. "
-                f"Genres: {str(row['genres']).replace('|', ', ').strip()}."
-            ), axis=1
-        )
-
-        # --- Debugging print: Check types and content before encoding ---
-        print("\n--- Debugging: Sample of 'search_text' column and its types ---")
-        print(self.movies_df[['title', 'genres', 'clean_title', 'search_text']].head())
-        print("Data types of 'search_text' column:", self.movies_df['search_text'].dtype)
-        print("Number of non-string values:", self.movies_df['search_text'].apply(lambda x: not isinstance(x, str)).sum())
-        print("Number of NaN values:", self.movies_df['search_text'].isna().sum())
-        print("--- End Debugging ---")
-        # --- END RE-VERIFY ---
-
-
-        self.embedding_model = SentenceTransformer(self.model_name)
-
-        print("Generating movie embeddings...")
-        # Add .fillna('') as a final safeguard just before encoding
-        embeddings = self.embedding_model.encode(
-            self.movies_df['search_text'].fillna('').tolist(),
-            convert_to_numpy=True
-        ).astype('float32') # FAISS requires float32
-
-        d = embeddings.shape[1]
-        self.movie_faiss_index = faiss.IndexFlatL2(d)
-        self.movie_faiss_index.add(embeddings)
-
-        self.movie_ids_map = self.movies_df.index.values
-
-        faiss.write_index(self.movie_faiss_index, self.movie_faiss_index_path)
-        self.movies_df.to_pickle(self.movie_df_path)
-        print("Movie models built and saved successfully.")
-        self._is_initialized = True
-
-    # Inside your MovieRecommender class
+            print(f"Error loading or building combined model: {e}")
+            self._is_initialized = False
 
     def _load_data(self):
         """
-        Loads movie data from the specified CSV file.
-        Assumes movies.csv is comma-separated with a header (movieId,title,genres).
-        Handles potential UnicodeDecodeError by trying common encodings.
+        Loads movie and anime data, combines them, and prepares for processing.
         """
-        if not os.path.exists(self.movies_data_path):
-            raise FileNotFoundError(f"Movie data file not found at: {self.movies_data_path}")
+        movies_df = self._load_single_csv(self.movies_data_path, 'movie')
+        anime_df = self._load_single_csv(self.anime_data_path, 'anime')
 
-        # Try common encodings
-        encodings_to_try = ['utf-8', 'latin-1', 'cp1252']
+        movies_df['unique_id'] = 'movie' + movies_df['contentId'].astype(str)
+        anime_df['unique_id'] = 'anime_' + anime_df['contentId'].astype(str)
+        
+        common_cols = ['unique_id', 'title', 'genres', 'type']
+        
+        combined_df = pd.concat([movies_df[common_cols], anime_df[common_cols]], ignore_index=True)
+        print(f"Successfully loaded and combined {len(movies_df)} movies and {len(anime_df)} anime.")
+        combined_df = combined_df.set_index('unique_id')
+        
+        return combined_df
+        
+    def _build_model(self):
+        """
+        Builds the SentenceTransformer embedding model, processes combined content data,
+        creates FAISS index, and saves them.
+        """
+        print("Building combined movie and anime recommendation model...")
+        self.movies_df = self._load_data()
+        print(f"Loading SentenceTransformer model: {self.model_name}")
+        self.embedding_model = SentenceTransformer(self.model_name)
+        
+        self.movies_df['clean_title'] = self.movies_df['title'].apply(lambda x: re.sub(r' \(\d{4}\)', '', x)).astype(str)
+      
+        self.movies_df['search_text'] = self.movies_df.apply(
+            lambda row: f"{row['type'].capitalize()} title: {row['clean_title']} Genres: {row['genres'].replace('|', ', ')}", axis=1
+        )
 
-        # --- IMPORTANT FIXES IN read_csv PARAMETERS ---
-        # `sep=','` because your file is comma-separated
-        # `header=0` (or just remove it) because your file HAS a header on the first row
-        # `names` is NOT needed if header is present and names match, but good to keep if you want to ensure order
-        # `engine='python'` is NOT needed for a single character separator like ','
-        # --- END IMPORTANT FIXES ---
+        movie_embeddings = self.embedding_model.encode(
+            self.movies_df['search_text'].tolist(),
+            convert_to_tensor=False,
+            show_progress_bar=True
+        ).astype('float32')
+        
+        print("Building FAISS index...")
+        dimension = movie_embeddings.shape[1]
+        self.movie_faiss_index = faiss.IndexFlatL2(dimension)
+        self.movie_faiss_index.add(movie_embeddings)
+        print(f"FAISS index built with {self.movie_faiss_index.ntotal} vectors.")
+        self.faiss_to_df_index_map = {idx: df_idx for idx, df_idx in enumerate(self.movies_df.index)}
+        
+        print("Saving FAISS index and processed DataFrame...")
+        os.makedirs(os.path.dirname(self.movie_faiss_index_path), exist_ok=True)
+        faiss.write_index(self.movie_faiss_index, self.movie_faiss_index_path)
+        with open(self.movie_df_path, 'wb') as f:
+            pickle.dump(self.movies_df, f) # Save the DataFrame with its unique_id index
+        print("Model building complete.")
 
-        for encoding in encodings_to_try:
-            try:
-                movies_df = pd.read_csv(
-                    self.movies_data_path,
-                    sep=',',  # <--- Change separator to comma
-                    header=0,  # <--- Specify that the first row (index 0) is the header
-                    # names=['movieId', 'title', 'genres'], # Optional: can remove if header names are exact
-                    encoding=encoding
-                    # Remove engine='python' as it's not needed for comma separator
-                )
-                print(f"Successfully loaded movies data with '{encoding}' encoding.")
-
-                # --- Debugging: Check the first few rows and types right after loading ---
-                print("\n--- Debugging: DataFrame head after initial load ---")
-                print(movies_df.head())
-                print("DataFrame columns and dtypes:")
-                print(movies_df.info())
-                print("--- End Debugging ---")
-
-                return movies_df
-            except UnicodeDecodeError:
-                print(f"Failed to load with '{encoding}' encoding. Trying next...")
-            except pd.errors.ParserError as pe:
-                print(f"Parsing error with '{encoding}' encoding: {pe}. Data might not be in expected ',' format.")
-            except Exception as e:
-                print(f"An unexpected error occurred while loading movies data with '{encoding}': {e}")
-                raise
-
-        raise ValueError("Could not load movies data with any tried encoding (utf-8, latin-1, cp1252) or parsing failed.")
-
-# ... (rest of the class definition) ...
-
-    def recommend_movies(self, query, top_k=5):
+    def recommend_movies(self, query, top_k=5, content_type=None):
         if not self._is_initialized:
-            return "Movie recommender is not initialized. Please check server logs.", []
+            return "Content recommender is not initialized. Please check server logs.", []
 
         query_embedding = self.embedding_model.encode([query]).astype('float32')
 
-        # Search FAISS index for top_k most similar movie embeddings
+        search_k = top_k * 5
+        
+        if search_k == 0:
+            return "No items in the content database to recommend from. Please ensure data is loaded.", []
+
         D, I = self.movie_faiss_index.search(query_embedding, top_k)
 
-        recommendations = []
-        for i in range(top_k):
-            # FAISS returns -1 for indices that don't exist (e.g., if top_k > total items)
-            if I[0][i] != -1:
-                original_df_index = self.movie_ids_map[I[0][i]]
-                movie = self.movies_df.loc[original_df_index].to_dict()
+        raw_recommendations = []
+        
+        for i in range(len(I[0])): 
+            if I[0][i] != -1: # Ensure FAISS returned a valid index (sometimes -1 means no valid result)
+                df_unique_id = self.faiss_to_df_index_map[I[0][i]]
+                content = self.movies_df.loc[df_unique_id].to_dict()
+                raw_recommendations.append(content)
+                
+        filtered_recommendations = []
+        for content_item in raw_recommendations:
+            if content_type is None or content_item['type'] == content_type:
+                output_item = {k: v for k, v in content_item.items() if k not in ['search_text', 'clean_title']}
+                
+                output_item['genres'] = output_item.get('genres', 'N/A').replace('|', ', ')
+                
+                filtered_recommendations.append(output_item)
+            
+            if len(filtered_recommendations) >= top_k:
+                break
 
-                # Exclude the 'search_text' and 'clean_title' from the final output dict
-                movie_output = {k: v for k, v in movie.items() if k not in ['search_text', 'clean_title']}
+        if not filtered_recommendations:
+            return "I couldn't find any recommendations for your query. Please try a different request or content type.", []
 
-                # --- IMPORTANT FIX HERE ---
-                # Ensure 'genres' is a string before calling replace.
-                # If it's NaN or None, convert it to an empty string or 'N/A'
-                raw_genres = movie_output.get('genres', 'N/A') # Use .get() to handle potential missing key, default to 'N/A'
-                movie_output['genres'] = str(raw_genres).replace('|', ', ') # Convert to string then replace
-                # --- END IMPORTANT FIX ---
-
-                recommendations.append(movie_output)
-
-        if not recommendations:
-            return "I couldn't find any movie recommendations for your query. Please try a different request.", []
-
-        return recommendations, recommendations
+        return filtered_recommendations, filtered_recommendations
+        
+        
 # Example usage (for testing this module directly)
 if __name__ == '__main__':
     # Create dummy data/models directories for local testing
